@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::env;
-use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
+use clap::{Parser, Subcommand};
 use proc_macro2::{Ident, Span};
 use serde::{Deserialize, Serialize};
 use syn::spanned::Spanned;
@@ -16,28 +15,15 @@ use syn::{
 };
 
 fn main() {
-    let config = match Config::from_args(env::args().skip(1)) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("{error}");
-            eprintln!("usage: dep-analysis [--internal-deps | --top-level-html <output.html> | --top-level-json <output.json> | --top-level-html-from-json <output.html>] <input>");
-            process::exit(2);
-        }
-    };
-
-    let result = match config.mode {
-        OutputMode::Usages => analyze_project(&config.path).map(|analysis| {
-            print_usages(&analysis.usages);
-        }),
-        OutputMode::InternalDependencies => analyze_project(&config.path).map(|analysis| {
-            print_internal_dependencies(&analysis);
-        }),
-        OutputMode::TopLevelHtml { output } => analyze_project(&config.path)
-            .and_then(|analysis| write_top_level_html(&analysis, &output)),
-        OutputMode::TopLevelJson { output } => analyze_project(&config.path)
-            .and_then(|analysis| write_top_level_json(&analysis, &output)),
-        OutputMode::TopLevelHtmlFromJson { output } => read_top_level_json(&config.path)
-            .and_then(|graph| write_top_level_html_from_graph(&graph, &output)),
+    let result = match Cli::parse().command {
+        Command::Analyse { rust_file, output } => analyze_project(&rust_file)
+            .map(|analysis| internal_dependencies(&analysis.usages, &analysis.module_paths))
+            .and_then(|dependencies| {
+                write_internal_dependencies_json(&dependencies, output.as_deref())
+            }),
+        Command::Visualise { json_file, output } => read_internal_dependencies_json(&json_file)
+            .map(|dependencies| top_level_graph(&dependencies))
+            .and_then(|graph| write_top_level_html_from_graph(&graph, output.as_deref())),
     };
 
     if let Err(error) = result {
@@ -46,140 +32,77 @@ fn main() {
     }
 }
 
-struct Config {
-    mode: OutputMode,
-    path: PathBuf,
+#[derive(Parser)]
+#[command(
+    author,
+    version,
+    about = "Analyse and visualise Rust module dependencies"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-enum OutputMode {
-    Usages,
-    InternalDependencies,
-    TopLevelHtml { output: PathBuf },
-    TopLevelJson { output: PathBuf },
-    TopLevelHtmlFromJson { output: PathBuf },
+#[derive(Subcommand)]
+enum Command {
+    /// Analyse a Rust file and output internal module dependency JSON.
+    Analyse {
+        /// Rust entry file to analyse.
+        rust_file: PathBuf,
+
+        /// Write JSON output to this file instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Visualise internal module dependency JSON as an HTML page.
+    Visualise {
+        /// Internal dependency JSON file produced by `analyse`.
+        json_file: PathBuf,
+
+        /// Write HTML output to this file instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
-impl Config {
-    fn from_args(args: impl IntoIterator<Item = String>) -> Result<Self, &'static str> {
-        let mut mode = OutputMode::Usages;
-        let mut path = None;
-        let mut args = args.into_iter();
+fn write_top_level_html_from_graph(
+    graph: &TopLevelGraph,
+    output: Option<&Path>,
+) -> Result<(), String> {
+    let html = render_top_level_html(&graph);
+    write_text_output(output, &html)
+}
 
-        while let Some(arg) = args.next() {
-            if arg == "--internal-deps" {
-                if !matches!(mode, OutputMode::Usages) {
-                    return Err("expected only one output mode");
-                }
-                mode = OutputMode::InternalDependencies;
-            } else if arg == "--top-level-html" {
-                if !matches!(mode, OutputMode::Usages) {
-                    return Err("expected only one output mode");
-                }
-                let Some(output) = args.next() else {
-                    return Err("--top-level-html requires an output path");
-                };
-                mode = OutputMode::TopLevelHtml {
-                    output: PathBuf::from(output),
-                };
-            } else if arg == "--top-level-json" {
-                if !matches!(mode, OutputMode::Usages) {
-                    return Err("expected only one output mode");
-                }
-                let Some(output) = args.next() else {
-                    return Err("--top-level-json requires an output path");
-                };
-                mode = OutputMode::TopLevelJson {
-                    output: PathBuf::from(output),
-                };
-            } else if arg == "--top-level-html-from-json" {
-                if !matches!(mode, OutputMode::Usages) {
-                    return Err("expected only one output mode");
-                }
-                let Some(output) = args.next() else {
-                    return Err("--top-level-html-from-json requires an output path");
-                };
-                mode = OutputMode::TopLevelHtmlFromJson {
-                    output: PathBuf::from(output),
-                };
-            } else if arg.starts_with("--") {
-                return Err("unknown option");
-            } else if path.replace(PathBuf::from(arg)).is_some() {
-                return Err("expected exactly one input file");
-            }
-        }
+fn write_internal_dependencies_json(
+    dependencies: &[InternalDependency],
+    output: Option<&Path>,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(dependencies)
+        .map_err(|error| format!("failed to serialize internal dependency json: {error}"))?;
+    write_text_output(output, &format!("{json}\n"))
+}
 
-        let Some(path) = path else {
-            return Err("expected an input file");
-        };
-
-        Ok(Self { mode, path })
+fn write_text_output(output: Option<&Path>, contents: &str) -> Result<(), String> {
+    if let Some(output) = output {
+        fs::write(output, contents)
+            .map_err(|error| format!("failed to write {}: {error}", output.display()))
+    } else {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        stdout
+            .write_all(contents.as_bytes())
+            .and_then(|_| stdout.flush())
+            .map_err(|error| format!("failed to write stdout: {error}"))
     }
 }
 
-fn print_usages(usages: &[Usage]) {
-    let file_prefix = shared_file_prefix(usages.iter().map(|usage| usage.file.as_path()));
-    let records = usages
-        .iter()
-        .map(|usage| {
-            let file = usage.file.strip_prefix(&file_prefix).unwrap_or(&usage.file);
-            UsageOutput {
-                file: file.display().to_string(),
-                line: usage.line,
-                origin: usage.origin.clone(),
-                symbol: usage.symbol.clone(),
-            }
-        })
-        .collect::<Vec<_>>();
-    print_json(&records);
-}
-
-fn print_internal_dependencies(analysis: &Analysis) {
-    let file_prefix = shared_file_prefix(analysis.usages.iter().map(|usage| usage.file.as_path()));
-    let records = internal_dependencies(&analysis.usages, &analysis.module_paths)
-        .into_iter()
-        .map(|dependency| {
-            let file = dependency
-                .file
-                .strip_prefix(&file_prefix)
-                .unwrap_or(&dependency.file);
-            InternalDependencyOutput {
-                file: file.display().to_string(),
-                line: dependency.line,
-                from_module: dependency.from_module,
-                to_module: dependency.to_module,
-            }
-        })
-        .collect::<Vec<_>>();
-    print_json(&records);
-}
-
-fn write_top_level_html(analysis: &Analysis, output: &Path) -> Result<(), String> {
-    let dependencies = internal_dependencies(&analysis.usages, &analysis.module_paths);
-    let graph = top_level_graph(&dependencies);
-    write_top_level_html_from_graph(&graph, output)
-}
-
-fn write_top_level_html_from_graph(graph: &TopLevelGraph, output: &Path) -> Result<(), String> {
-    let html = render_top_level_html(&graph);
-    fs::write(output, html)
-        .map_err(|error| format!("failed to write {}: {error}", output.display()))
-}
-
-fn write_top_level_json(analysis: &Analysis, output: &Path) -> Result<(), String> {
-    let dependencies = internal_dependencies(&analysis.usages, &analysis.module_paths);
-    let graph = top_level_graph(&dependencies);
-    let json = serde_json::to_string_pretty(&graph)
-        .map_err(|error| format!("failed to serialize top-level graph json: {error}"))?;
-    fs::write(output, format!("{json}\n"))
-        .map_err(|error| format!("failed to write {}: {error}", output.display()))
-}
-
-fn read_top_level_json(path: &Path) -> Result<TopLevelGraph, String> {
+fn read_internal_dependencies_json(path: &Path) -> Result<Vec<InternalDependency>, String> {
     let json = fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     serde_json::from_str(&json).map_err(|error| {
         format!(
-            "failed to parse {} as top-level graph json: {error}",
+            "failed to parse {} as internal dependency json: {error}",
             path.display()
         )
     })
@@ -495,6 +418,9 @@ let selectedNode = null;
 let focusAnimation = 0;
 let pinnedNode = null;
 let activeDragNode = null;
+let localRelaxNode = null;
+let localRelaxStart = 0;
+let localRelaxUntil = 0;
 const edgeEls = edges.map(edge => {{
   const group = svgEl("g", {{ class: "edge" }});
   const line = svgEl("line", {{
@@ -527,11 +453,24 @@ let running = true;
 requestAnimationFrame(tick);
 
 function tick() {{
+  taperLocalRelax();
   for (let step = 0; step < 2; step++) applyForces();
   render();
   alpha *= 0.985;
-  running = alpha > 0.01 || nodes.some(node => node.dragging);
+  if (localRelaxNode && performance.now() >= localRelaxUntil) {{
+    localRelaxNode = null;
+    settleSimulation();
+  }}
+  running = alpha > 0.01 || nodes.some(node => node.dragging) || localRelaxNode;
   if (running) requestAnimationFrame(tick);
+}}
+
+function taperLocalRelax() {{
+  if (!localRelaxNode) return;
+  const remaining = Math.max(0, localRelaxUntil - performance.now());
+  const duration = Math.max(1, localRelaxUntil - localRelaxStart);
+  const strength = remaining / duration;
+  alpha = Math.min(alpha, 0.75 * easeInOutCubic(strength));
 }}
 
 function reheat() {{
@@ -543,8 +482,9 @@ function reheat() {{
 }}
 
 function applyForces() {{
-  if (activeDragNode && !selectedNode) {{
-    applyLocalDragForces(activeDragNode);
+  const localForceNode = activeDragNode || localRelaxNode;
+  if (localForceNode && !selectedNode) {{
+    applyLocalDragForces(localForceNode);
     return;
   }}
 
@@ -695,6 +635,7 @@ function boxEdgeOffset(ux, uy) {{
 function installDrag(element, node) {{
   element.addEventListener("pointerdown", event => {{
     element.setPointerCapture(event.pointerId);
+    localRelaxNode = null;
     releasePreviousPinnedNode(node);
     node.dragging = true;
     node.moved = false;
@@ -730,9 +671,20 @@ function releaseDrag(element, event, node) {{
     toggleSelection(node);
   }} else {{
     pinNode(node);
+    startLocalRelax(node);
+  }}
+}}
+
+function startLocalRelax(node) {{
+  if (selectedNode) {{
     settleSimulation();
     render();
+    return;
   }}
+  localRelaxNode = node;
+  localRelaxStart = performance.now();
+  localRelaxUntil = performance.now() + 1000;
+  reheat();
 }}
 
 function releasePreviousPinnedNode(nextNode) {{
@@ -933,6 +885,10 @@ function easeOutCubic(progress) {{
   return 1 - Math.pow(1 - progress, 3);
 }}
 
+function easeInOutCubic(progress) {{
+  return progress < 0.5 ? 4 * progress * progress * progress : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+}}
+
 function kindPriority(kind) {{
   if (kind === "bidirectional") return 3;
   if (kind === "outgoing") return 2;
@@ -1062,35 +1018,6 @@ fn escape_script_json(input: &str) -> String {
         .replace('>', "\\u003e")
 }
 
-fn print_json<T: Serialize>(value: &T) {
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-    if let Err(error) = serde_json::to_writer_pretty(&mut stdout, value) {
-        eprintln!("failed to serialize json output: {error}");
-        process::exit(1);
-    }
-    if let Err(error) = writeln!(stdout) {
-        eprintln!("failed to write json output: {error}");
-        process::exit(1);
-    }
-}
-
-#[derive(Serialize)]
-struct UsageOutput {
-    file: String,
-    line: usize,
-    origin: String,
-    symbol: String,
-}
-
-#[derive(Serialize)]
-struct InternalDependencyOutput {
-    file: String,
-    line: usize,
-    from_module: String,
-    to_module: String,
-}
-
 fn internal_dependencies(
     usages: &[Usage],
     module_paths: &BTreeSet<Vec<String>>,
@@ -1202,7 +1129,7 @@ fn module_path_to_string(module_path: &[String]) -> String {
     module_path.join("::")
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct InternalDependency {
     file: PathBuf,
     line: usize,
@@ -1658,36 +1585,6 @@ fn normalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_owned())
 }
 
-fn shared_file_prefix<'a>(paths: impl IntoIterator<Item = &'a Path>) -> PathBuf {
-    let mut paths = paths.into_iter();
-    let Some(first) = paths.next() else {
-        return PathBuf::new();
-    };
-
-    let mut prefix = path_component_strings(first.parent().unwrap_or(first));
-    for path in paths {
-        let components = path_component_strings(path.parent().unwrap_or(path));
-        let shared_len = prefix
-            .iter()
-            .zip(components.iter())
-            .take_while(|(left, right)| left == right)
-            .count();
-        prefix.truncate(shared_len);
-    }
-
-    let mut path = PathBuf::new();
-    for component in prefix {
-        path.push(component);
-    }
-    path
-}
-
-fn path_component_strings(path: &Path) -> Vec<OsString> {
-    path.components()
-        .map(|component| component.as_os_str().to_owned())
-        .collect()
-}
-
 fn ident_to_string(ident: &Ident) -> String {
     ident.to_string().trim_start_matches("r#").to_owned()
 }
@@ -1780,8 +1677,8 @@ mod tests {
 
     use super::{
         analyze_project, dependency_usages, dependency_usages_for_file, internal_dependencies,
-        render_top_level_html, shared_file_prefix, top_level_graph, FileLocalUsage,
-        InternalDependency, TopLevelEdge, Usage,
+        render_top_level_html, top_level_graph, FileLocalUsage, InternalDependency, TopLevelEdge,
+        Usage,
     };
 
     fn usages(source: &str) -> Vec<FileLocalUsage> {
@@ -2111,9 +2008,14 @@ mod outer {
         assert!(html.contains("function releasePreviousPinnedNode(nextNode)"));
         assert!(html.contains("function pinNode(node)"));
         assert!(html.contains("let activeDragNode = null;"));
+        assert!(html.contains("let localRelaxNode = null;"));
+        assert!(html.contains("function taperLocalRelax()"));
         assert!(html.contains("function applyLocalDragForces(draggedNode)"));
         assert!(html.contains("function applyLocalCollisionForces()"));
-        assert!(html.contains("if (activeDragNode && !selectedNode)"));
+        assert!(html.contains("function startLocalRelax(node)"));
+        assert!(html.contains("localRelaxUntil = performance.now() + 1000;"));
+        assert!(html.contains("function easeInOutCubic(progress)"));
+        assert!(html.contains("if (localForceNode && !selectedNode)"));
         assert!(html.contains("function focusedNeighbors(node)"));
         assert!(html.contains("function placeFocusGroup(items"));
         assert!(html.contains("function animateFocusLayout(focusNodes, keepFixed)"));
@@ -2135,34 +2037,6 @@ mod outer {
         assert!(html.contains("function selectedEdgeKind(edge)"));
         assert!(html.contains("function selectedEdgeKindFor(edge, node)"));
         assert!(html.contains("return \"bidirectional\";"));
-    }
-
-    #[test]
-    fn finds_shared_file_prefix_from_parent_dirs() {
-        assert_eq!(
-            shared_file_prefix(
-                [
-                    PathBuf::from("/repo/core/src/lib.rs"),
-                    PathBuf::from("/repo/core/src/foo/bar.rs"),
-                    PathBuf::from("/repo/core/src/foo/baz.rs"),
-                ]
-                .iter()
-                .map(|path| path.as_path())
-            ),
-            PathBuf::from("/repo/core/src")
-        );
-    }
-
-    #[test]
-    fn single_file_prefix_is_its_parent_dir() {
-        assert_eq!(
-            shared_file_prefix(
-                [PathBuf::from("/repo/core/src/lib.rs")]
-                    .iter()
-                    .map(|path| path.as_path())
-            ),
-            PathBuf::from("/repo/core/src")
-        );
     }
 
     fn usage(line: usize, origin: &str, symbol: &str) -> FileLocalUsage {
