@@ -2,7 +2,9 @@
 
 `dep-analysis` is a small Rust dependency exploration tool.
 
-It parses a Rust entry file, recursively follows `mod` declarations, and records which internal modules reference which other internal modules. It can then turn that JSON into a self-contained interactive HTML page that shows top-level module dependencies as boxes and arrows.
+It parses a Rust entry file, recursively follows `mod` declarations, and writes JSON records showing which internal modules reference which other internal modules. It can then turn those records into a self-contained interactive HTML page that shows top-level module dependencies as boxes and arrows.
+
+![Example dependency graph](example.png)
 
 ## Usage
 
@@ -18,7 +20,7 @@ Visualise that JSON as an HTML graph:
 cargo run -- visualise dependencies.json -o dependencies.html
 ```
 
-If `-o` is omitted, output is written to stdout.
+For `analyse`, omitting `-o` writes JSON to stdout. For `visualise`, omitting `-o` writes the HTML to a temporary file and opens it with `open`.
 
 ## Output
 
