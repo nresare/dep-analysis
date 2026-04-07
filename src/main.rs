@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command as ProcessCommand};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use proc_macro2::{Ident, Span};
@@ -23,7 +24,7 @@ fn main() {
             }),
         Command::Visualise { json_file, output } => read_internal_dependencies_json(&json_file)
             .map(|dependencies| top_level_graph(&dependencies))
-            .and_then(|graph| write_top_level_html_from_graph(&graph, output.as_deref())),
+            .and_then(|graph| write_or_open_top_level_html(&graph, output.as_deref())),
     };
 
     if let Err(error) = result {
@@ -60,18 +61,45 @@ enum Command {
         /// Internal dependency JSON file produced by `analyse`.
         json_file: PathBuf,
 
-        /// Write HTML output to this file instead of stdout.
+        /// Write HTML output to this file instead of opening a temporary HTML page.
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
 }
 
-fn write_top_level_html_from_graph(
+fn write_or_open_top_level_html(
     graph: &TopLevelGraph,
     output: Option<&Path>,
 ) -> Result<(), String> {
     let html = render_top_level_html(&graph);
-    write_text_output(output, &html)
+    if let Some(output) = output {
+        return write_text_output(Some(output), &html);
+    }
+
+    let output = temporary_html_path();
+    write_text_output(Some(&output), &html)?;
+    open_html_file(&output)
+}
+
+fn temporary_html_path() -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!("dep-analysis-{}-{timestamp}.html", process::id()))
+}
+
+fn open_html_file(path: &Path) -> Result<(), String> {
+    let status = ProcessCommand::new("open")
+        .arg(path)
+        .status()
+        .map_err(|error| format!("failed to run open {}: {error}", path.display()))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("open {} exited with {status}", path.display()))
+    }
 }
 
 fn write_internal_dependencies_json(
@@ -602,12 +630,25 @@ function applyPairForce(a, b, fx, fy) {{
 function render() {{
   for (const {{ edge, line, label }} of edgeEls) {{
     const points = edgePoints(edge.source, edge.target);
+    const labelPoint = edgeLabelPoint(edge);
     setAttrs(line, {{ x1: points.x1, y1: points.y1, x2: points.x2, y2: points.y2 }});
-    setAttrs(label, {{ x: (edge.source.x + edge.target.x) / 2, y: (edge.source.y + edge.target.y) / 2 }});
+    setAttrs(label, {{ x: labelPoint.x, y: labelPoint.y }});
   }}
   for (const {{ node, group }} of nodeEls) {{
     setAttrs(group, {{ transform: `translate(${{node.x}}, ${{node.y}})` }});
   }}
+}}
+
+function edgeLabelPoint(edge) {{
+  const dx = edge.target.x - edge.source.x;
+  const dy = edge.target.y - edge.source.y;
+  const length = Math.max(1, Math.hypot(dx, dy));
+  const hasReverse = edgeKeys.has(`${{edge.target.id}}->${{edge.source.id}}`);
+  const offset = hasReverse ? 18 : 0;
+  return {{
+    x: (edge.source.x + edge.target.x) / 2 - dy / length * offset,
+    y: (edge.source.y + edge.target.y) / 2 + dx / length * offset
+  }};
 }}
 
 function edgePoints(from, to) {{
@@ -2016,6 +2057,8 @@ mod outer {
         assert!(html.contains("localRelaxUntil = performance.now() + 1000;"));
         assert!(html.contains("function easeInOutCubic(progress)"));
         assert!(html.contains("if (localForceNode && !selectedNode)"));
+        assert!(html.contains("function edgeLabelPoint(edge)"));
+        assert!(html.contains("const offset = hasReverse ? 18 : 0;"));
         assert!(html.contains("function focusedNeighbors(node)"));
         assert!(html.contains("function placeFocusGroup(items"));
         assert!(html.contains("function animateFocusLayout(focusNodes, keepFixed)"));
